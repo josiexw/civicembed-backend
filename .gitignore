@@ -1,2 +1,5 @@
 models/
 *.parquet
+*.arrow
+venv/
+data/
