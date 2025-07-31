@@ -1,8 +1,8 @@
 import pyarrow.parquet as pq
 import pyarrow as pa
 
-parquet_path = "all_water_embeddings.parquet"
-arrow_path = "all_water_embeddings.arrow"
+parquet_path = "parquet_filename"
+arrow_path = "arrow_filename"
 
 pq_file = pq.ParquetFile(parquet_path)
 

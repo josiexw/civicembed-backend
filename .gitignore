@@ -3,3 +3,4 @@ models/
 *.arrow
 venv/
 data/
+*.db
