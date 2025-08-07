@@ -4,8 +4,8 @@ import sqlite3
 import pandas as pd
 import numpy as np
 from flask_cors import CORS
-import time
 import faiss
+import traceback
 
 app = Flask(__name__)
 CORS(app)
@@ -18,6 +18,7 @@ SWITZERLAND_BOUNDS = {
     "east": 10.4922,
     "west": 5.9559
 }
+BIN_SIZE = 0.001
 
 def get_bounding_box(location_name):
     location = geolocator.geocode(location_name, exactly_one=True, addressdetails=False)
@@ -31,55 +32,69 @@ def get_bounding_box(location_name):
         "west": max(lon - 0.05, SWITZERLAND_BOUNDS["west"]),
     }
 
+def clamp_bbox(bbox):
+    return {
+        "north": min(max(bbox["north"], SWITZERLAND_BOUNDS["south"]), SWITZERLAND_BOUNDS["north"]),
+        "south": min(max(bbox["south"], SWITZERLAND_BOUNDS["south"]), SWITZERLAND_BOUNDS["north"]),
+        "east": min(max(bbox["east"], SWITZERLAND_BOUNDS["west"]), SWITZERLAND_BOUNDS["east"]),
+        "west": min(max(bbox["west"], SWITZERLAND_BOUNDS["west"]), SWITZERLAND_BOUNDS["east"]),
+    }
+
 def are_adjacent(cell1, cell2, cell_size=0.05):
-    lat_diff = abs(cell1["lat"] - cell2["lat"])
-    lng_diff = abs(cell1["lng"] - cell2["lng"])
-    return lat_diff <= cell_size and lng_diff <= cell_size and (lat_diff + lng_diff > 0)
+    return (
+        abs(cell1["lat"] - cell2["lat"]) <= cell_size and
+        abs(cell1["lng"] - cell2["lng"]) <= cell_size and
+        (cell1["lat"] != cell2["lat"] or cell1["lng"] != cell2["lng"])
+    )
 
 def merge_bounding_boxes(cells):
     lats = [cell["lat"] for cell in cells]
     lngs = [cell["lng"] for cell in cells]
-    cell_size = 0.05
+    cs = 0.05
     return {
-        "north": max(lats) + cell_size / 2,
-        "south": min(lats) - cell_size / 2,
-        "east": max(lngs) + cell_size / 2,
-        "west": min(lngs) - cell_size / 2,
+        "north": max(lats) + cs / 2,
+        "south": min(lats) - cs / 2,
+        "east": max(lngs) + cs / 2,
+        "west": min(lngs) - cs / 2,
     }
 
 def group_adjacent_cells(df, topK, cell_size=0.05):
     visited = np.zeros(len(df), dtype=bool)
     groups = []
-
     for i, row in df.iterrows():
         if visited[i]:
             continue
-
         group = [row]
         visited[i] = True
-
         for j in range(i + 1, len(df)):
             if visited[j]:
                 continue
             if any(are_adjacent(r, df.iloc[j], cell_size) for r in group):
                 group.append(df.iloc[j])
                 visited[j] = True
-
         groups.append(group)
         if len(groups) >= topK:
             break
-
     return [merge_bounding_boxes(group) for group in groups]
 
-def query_grid_data(lens, bbox):
-    conn = sqlite3.connect(DB_PATH)
-    query = f"""
-    SELECT * FROM {lens}
-    WHERE lat BETWEEN ? AND ?
-    AND lon BETWEEN ? AND ?
-    """
-    df = pd.read_sql_query(query, conn, params=(bbox["south"], bbox["north"], bbox["west"], bbox["east"]))
-    conn.close()
+def bin_latlon(df, bin_size=BIN_SIZE):
+    df["lat_bin"] = (df.index.get_level_values("lat") / bin_size).round().astype(int)
+    df["lng_bin"] = (df.index.get_level_values("lng") / bin_size).round().astype(int)
+    df = df.reset_index(drop=True).groupby(["lat_bin", "lng_bin"]).mean()
+    return df
+
+def load_and_bin_lens_data(conn, lens, bbox=None):
+    if bbox:
+        query = f"SELECT * FROM {lens} WHERE lat BETWEEN ? AND ? AND lon BETWEEN ? AND ?"
+        params = (bbox["south"], bbox["north"], bbox["west"], bbox["east"])
+    else:
+        query = f"SELECT * FROM {lens}"
+        params = ()
+    df = pd.read_sql_query(query, conn, params=params)
+    df.rename(columns={"lon": "lng"}, inplace=True)
+    df.set_index(["lat", "lng"], inplace=True)
+    df = bin_latlon(df)
+    df.columns = [f"{lens}_{col}" for col in df.columns]
     return df
 
 @app.route("/api/search", methods=["POST"])
@@ -87,53 +102,84 @@ def search_topk_cells():
     data = request.get_json()
     location = data["location"]
     topK = int(data["topK"])
-    lens = data.get("lens").lower()
+    lenses = [l.lower() for l in data.get("lens", [])]
 
     try:
-        start_total = time.time()
-
         bbox = get_bounding_box(location)
-        local_df = query_grid_data(lens, bbox)
+        conn = sqlite3.connect(DB_PATH)
 
-        if local_df.empty:
+        # Load and join local lens data
+        dfs = [load_and_bin_lens_data(conn, lens, bbox) for lens in lenses]
+        joined_df = pd.concat(dfs, axis=1, join="inner").dropna().reset_index()
+        if joined_df.empty:
             return jsonify({"boundingBox": bbox, "topKCells": []})
 
-        feature_cols = [col for col in local_df.columns if col not in ("lat", "lon")]
-        local_features = local_df[feature_cols].to_numpy().astype("float32")
+        joined_df["lat"] = joined_df["lat_bin"] * BIN_SIZE
+        joined_df["lng"] = joined_df["lng_bin"] * BIN_SIZE
+        joined_df.drop(columns=["lat_bin", "lng_bin"], inplace=True)
+
+        feature_cols = [col for col in joined_df.columns if col not in ("lat", "lng")]
+        local_features = joined_df[feature_cols].to_numpy().astype("float32")
         query_vec = np.mean(local_features, axis=0).reshape(1, -1)
 
-        conn = sqlite3.connect(DB_PATH)
-        full_df = pd.read_sql_query(
-            f"SELECT * FROM {lens} WHERE lat BETWEEN ? AND ? AND lon BETWEEN ? AND ?",
-            conn,
-            params=(SWITZERLAND_BOUNDS["south"], SWITZERLAND_BOUNDS["north"],
-                    SWITZERLAND_BOUNDS["west"], SWITZERLAND_BOUNDS["east"])
-        )
+        # Load and join full data
+        dfs_full = []
+        lens_dims = {}
+        for lens in lenses:
+            df_lens = load_and_bin_lens_data(conn, lens)
+            lens_dims[lens] = len(df_lens.columns)
+            dfs_full.append(df_lens)
         conn.close()
 
-        full_df = full_df.rename(columns={"lon": "lng"})
-        full_features = full_df[feature_cols].to_numpy().astype("float32")
+        full_df = pd.concat(dfs_full, axis=1, join="outer").dropna().reset_index()
+        if full_df.empty:
+            return jsonify({"boundingBox": bbox, "topKCells": []})
 
-        # Use FAISS for fast similarity search
+        full_df["lat"] = full_df["lat_bin"] * BIN_SIZE
+        full_df["lng"] = full_df["lng_bin"] * BIN_SIZE
+        full_df.drop(columns=["lat_bin", "lng_bin"], inplace=True)
+
+        full_features = full_df.drop(columns=["lat", "lng"]).to_numpy().astype("float32")
+
         index = faiss.IndexFlatL2(full_features.shape[1])
         index.add(full_features)
         distances, indices = index.search(query_vec, topK * 10)
 
-        topk_df = full_df.iloc[indices[0]].copy()
-        topk_df["similarity"] = -distances[0]  # Negate distance to use as similarity
+        max_distance = max(distances[0].max(), 1e-6)
+        similarities = 1 - distances[0] / max_distance
 
+        topk_df = full_df.iloc[indices[0]].copy()
+        topk_df["similarity"] = similarities
         candidate_df = topk_df.reset_index(drop=True)
         topk_bounding_boxes = group_adjacent_cells(candidate_df, topK)
 
-        print("Search completed in", time.time() - start_total, "seconds")
+        qvec = query_vec[0]
+        lens_similarities = []
+
+        for idx in indices[0]:
+            lens_sim_entry = {}
+            offset = 0
+            for lens in lenses:
+                dim = lens_dims[lens]
+                vec = full_features[idx][offset:offset+dim]
+                qvec_lens = qvec[offset:offset+dim]
+                dist = np.linalg.norm(qvec_lens - vec)
+                scale = np.linalg.norm(qvec_lens) + 1e-6
+                sim = 1 - dist / scale
+                lens_sim_entry[lens] = float(sim)
+                offset += dim
+            lens_similarities.append(lens_sim_entry)
 
         return jsonify({
             "boundingBox": bbox,
-            "topKCells": topk_bounding_boxes
+            "topKCells": [clamp_bbox(b) for b in topk_bounding_boxes],
+            "similarities": similarities[:len(topk_bounding_boxes)].tolist(),
+            "lensSimilarity": lens_similarities[:len(topk_bounding_boxes)]
         })
 
     except Exception as e:
-        print("Error:", e)
+        print("[ERROR]", e)
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
