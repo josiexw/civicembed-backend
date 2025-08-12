@@ -5,3 +5,4 @@ venv/
 data/
 faiss_indexes/
 *.npz
+*.db
