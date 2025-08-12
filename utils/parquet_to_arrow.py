@@ -1,8 +1,8 @@
 import pyarrow.parquet as pq
 import pyarrow as pa
 
-parquet_path = "data/all_road_embeddings.parquet"
-arrow_path = "data/all_road_embeddings.arrow"
+parquet_path = "data/vegetation.parquet"
+arrow_path = "data/vegetation.arrow"
 
 pq_file = pq.ParquetFile(parquet_path)
 

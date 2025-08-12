@@ -3,4 +3,5 @@ models/
 *.arrow
 venv/
 data/
-*.db
+faiss_indexes/
+*.npz
